@@ -1,274 +1,184 @@
 import numpy as np
 import pandas as pd
-
 import glob
 import os
 import time
-import copy
 
 import tensorflow as tf
-import tensorflow.keras.backend as K
+from tensorflow.keras import losses
 
-from tensorflow.keras import layers, losses, regularizers
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import BatchNormalization, Activation, Conv1D, Concatenate, AveragePooling1D, Conv2DTranspose,Lambda
-
-from sklearn import manifold, datasets
-from sklearn.preprocessing import scale
+from sklearn import manifold
 import matplotlib.pyplot as plt
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-# print(tf.__version__)
-
-def create_dataset():
-    datas = glob.glob('transfer0508_2/*/*/*.txt')
-    train_data = []
-    train_label = [] 
-    for data in datas:
-        if data.find('timestamp') == -1:
-            f = np.loadtxt(data,delimiter=" ").copy()
-            f = f/[100,10,100,1,10,100,1e+13,1,1e+3,1e+15]
-            f = f[[0,1,2,4]]
-            train_data.append(f) #/100000000
-            if data.split('/')[1] == "indoor":
-                train_label.append("indoor"+data.split('/')[-2])
-            else:
-                train_label.append("outdoor"+data.split('/')[-2])
-            
-
-    train_data = np.array(train_data).astype('float32')
-    train_label = np.array(pd.get_dummies(train_label)).astype('float32')
-
-    train_val_split = np.random.rand(len(train_data)) < 0.70
-    train_x = train_data[train_val_split]
-    train_y = train_label[train_val_split]
-    val_x = train_data[~train_val_split]
-    val_y = train_label[~train_val_split]
-
-    return train_x, train_y, val_x, val_y
-
-def create_night_dataset():
-    datas = glob.glob('transfer0508_night_2/*/*/*.txt')
-    train_data = []
-    train_label = [] 
-    for data in datas:
-        if data.find('timestamp') == -1:
-            f = np.loadtxt(data,delimiter=" ").copy()
-            f = f/[100,10,100,1,10,100,1e+13,1,1e+3,1e+15]
-            f = f[[0,1,2,4]]
-            train_data.append(f)
-            if data.split('/')[1] == "indoor":
-                train_label.append("indoor"+data.split('/')[-2])
-            else:
-                train_label.append("outdoor"+data.split('/')[-2])
-            
-    train_data = np.array(train_data).astype('float32')
-    train_label = np.array(pd.get_dummies(train_label)).astype('float32')
-
-    train_val_split = np.random.rand(len(train_data)) < 0.70
-
-    val_x2 = train_data[~train_val_split]
-    val_y2 = train_label[~train_val_split]
-
-    return val_x2, val_y2
-
-def H_l(k, bottleneck_size, kernel_width):
-    """ 
-    A single convolutional "layer" as defined by Huang et al. Defined as H_l in the original paper
-    
-    :param k: int representing the "growth rate" of the DenseNet
-    :param bottleneck_size: int representing the size of the bottleneck, as a multiple of k. Set to 0 for no bottleneck.
-    :param kernel_width: int representing the width of the main convolutional kernel
-    :return a function wrapping the keras layers for H_l
-    """
-
-    use_bottleneck = bottleneck_size > 0
-    num_bottleneck_output_filters = k * bottleneck_size
-
-    def f(x):
-        if use_bottleneck:
-            x = BatchNormalization()(x)
-            x = Activation("relu")(x)
-            x = Conv1D(
-                num_bottleneck_output_filters,
-                1,
-                strides=1,
-                padding="same",
-                dilation_rate=1)(x)
-        x = BatchNormalization()(x)
-        x = Activation("relu")(x)
-        x = Conv1D(
-            k,
-            kernel_width,
-            strides=1,
-            padding="same",
-            dilation_rate=1)(x)
-        return x
-    return f
-
-def dense_block(k, num_layers, kernel_width, bottleneck_size):
-    """
-    A single dense block of the DenseNet
-    
-    :param k: int representing the "growth rate" of the DenseNet
-    :param num_layers: int represending the number of layers in the block
-    :param kernel_width: int representing the width of the main convolutional kernel
-    :param bottleneck_size: int representing the size of the bottleneck, as a multiple of k. Set to 0 for no bottleneck.
-    :return a function wrapping the entire dense block
-    """
-    def f(x):
-        layers_to_concat = [x]
-        for _ in range(num_layers):
-            x = H_l(k, bottleneck_size, kernel_width)(x)
-            layers_to_concat.append(x)
-            x = Concatenate(axis=-1)(copy.copy(layers_to_concat))
-        return x
-    return f
-
-def transition_block(pool_size=2, stride=1, theta=0.5):
-    """
-    A single transition block of the DenseNet
-    
-    :param pool_size: int represending the width of the average pool
-    :param stride: int represending the stride of the average pool
-    :param theta: int representing the amount of compression in the 1x1 convolution. Set to 1 for no compression.
-    :return a function wrapping the entire transition block
-    """    
-    assert theta > 0 and theta <= 1
-
-    def f(x):
-        num_transition_output_filters = int(int(x.shape[2]) * float(theta))
-        x = BatchNormalization()(x)
-        x = Activation("relu")(x)
-        x = Conv1D(
-            num_transition_output_filters,
-            1,
-            strides=1,
-            padding="same",
-            dilation_rate=1)(x)
-        x = AveragePooling1D(
-            pool_size=pool_size,
-            strides=stride)(x)
-        return x
-    return f
-
-def Conv1DTranspose(filters, kernel_size, strides=2, padding='same'):
-    def f(x):
-        x = Lambda(lambda x: K.expand_dims(x, axis=2))(x)
-        x = Conv2DTranspose(filters=filters, kernel_size=(kernel_size, 1), strides=(strides, 1), padding=padding)(x)
-        x = Lambda(lambda x: K.squeeze(x, axis=2))(x)
-        return x
-    return f
+from network_module import dense_block, transition_block, Conv1DTranspose
 
 
-def create_model():
-    inp = tf.keras.layers.Input(shape=(4), name='input_layer1')
-    model = tf.keras.layers.Reshape((4,1))(inp)
-    model = tf.keras.layers.Conv1D(32,3)(model)
-    model = tf.keras.layers.AveragePooling1D(strides=1,padding="same")(model)
-    model = dense_block(32,3,3,4)(model)
-    model = transition_block(stride=1)(model)
-    model = dense_block(4,3,3,4)(model)
-    model_down = tf.keras.Model(inputs=[inp], outputs=model)
+class GPS_AE():
+    def __init__(self):
+        self.train_x, self.train_y, self.val_x, self.val_y = self.create_dataset()
+        self.val_x2, self.val_y2 = self.create_night_dataset()
 
-    inp = tf.keras.layers.Input(shape=(4), name='input_layer2')
-    model = model_down(inp)
-    model = Conv1DTranspose(32,3,1,'valid')(model)
-    model = tf.keras.layers.AveragePooling1D(strides=1,padding='same')(model)
-    model = Conv1DTranspose(1,3,1,'valid')(model)
-    model = tf.keras.layers.AveragePooling1D(strides=1)(model)
-    model = tf.keras.layers.Reshape((4,))(model)
-    model_encoder_decoder = tf.keras.Model(inputs=[inp], outputs=model)
+        self.val_x3 = np.concatenate((self.val_x, self.val_x2))
+        self.val_y3 = np.concatenate((self.val_y, self.val_y2))
 
-    return model_down, model_encoder_decoder
+        BUFFER_SIZE = self.train_x.shape[0]
+        BATCH_SIZE = self.train_x.shape[0]
+        self.train_dataset = tf.data.Dataset.from_tensor_slices((self.train_x, self.train_y))
+        self.train_dataset = self.train_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+        self.valid_dataset = tf.data.Dataset.from_tensor_slices((self.val_x3, self.val_y3)).batch(len(self.val_x3))
 
-def train_step(t_x,t_y):
-    with tf.GradientTape() as AE_tape,tf.GradientTape() as ANN_tape:
-        output = model_encoder_decoder(t_x, training=True)
-        AE_loss = model_loss(output,t_x)
+        self.model_down, self.model_encoder_decoder = self.create_model()
+        # self.model_down.summary()
+        # self.model_encoder_decoder.summary()
+        
+        self.model_loss = losses.MeanSquaredError()
+        self.learning_rate_A = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1e-2, decay_steps=100, decay_rate=0.9)
+        self.optimizer_A = tf.optimizers.Adam() #SGD(learning_rate=learning_rate_A , momentum=1e-5)
+        self.learning_rate_B = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1e-2, decay_steps=100, decay_rate=0.9)
+        self.optimizer_B = tf.optimizers.Adam(learning_rate=self.learning_rate_B)
 
-    gradients_AE = AE_tape.gradient(AE_loss, model_encoder_decoder.trainable_variables)
-    optimizer_A.apply_gradients(zip(gradients_AE, model_encoder_decoder.trainable_variables))
-    
-    return np.array(AE_loss).mean()#,np.array(ANN_loss).mean()
+        checkpoint_dir = './gps_checkpoints/checkpoints_0710_LPS_2_2'
+        self.checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_0710_model_{epoch}")
+        self.checkpoint = tf.train.Checkpoint(optimizerA=self.optimizer_A, model_encoder_decoder=self.model_encoder_decoder, model_down=self.model_down)
 
-def validation(v_x,v_y):
-    output = model_encoder_decoder(v_x)
-    mse = losses.MeanSquaredError()
-    AE_loss = mse(v_x,output)
-    print("AE loss : {}".format(np.array(AE_loss).mean()))
-    return np.array(AE_loss).mean()
-    
-def train(epochs):
-    minimum_delta = 0.00001
-    history = {}
-    history['val_loss'] = np.zeros(epochs)
-    for epoch in range(epochs):
-        start = time.time()
-        all_AE = []
-        for x,y in train_dataset:
-            AE_loss = train_step(x,y)
-            all_AE.append(AE_loss)
-        print("train AE loss : {}".format(np.array(all_AE).mean()))
-        loss = validation(val_x,val_y)
-        history['val_loss'][epoch] = loss
-        checkpoint.save(file_prefix=checkpoint_prefix)
+    def create_dataset(self):
+        datas = glob.glob('transfer0508_2/*/*/*.txt')
+        train_data = []
+        train_label = [] 
+        for data in datas:
+            if data.find('timestamp') == -1:
+                f = np.loadtxt(data,delimiter=" ").copy()
+                f = f/[100,10,100,1,10,100,1e+13,1,1e+3,1e+15]
+                f = f[[0,1,2,4]]
+                train_data.append(f) #/100000000
+                if data.split('/')[1] == "indoor":
+                    train_label.append("indoor"+data.split('/')[-2])
+                else:
+                    train_label.append("outdoor"+data.split('/')[-2])
+                
 
-        if epoch > 200: #early stop
-                differences = np.abs(np.diff(history['val_loss'][epoch - 3:epoch], n = 1))
-                check =  differences > minimum_delta        
-                if np.all(check == False):
-                    print(differences)
-                    print("\n\nEarlyStopping Evoked! Stopping training\n\n")
-                    break
-                    
-        print(f'Time for epoch {epoch + 1} is {time.time() - start:.4f} sec')
+        train_data = np.array(train_data).astype('float32')
+        train_label = np.array(pd.get_dummies(train_label)).astype('float32')
 
-def plot_result():
-    val_latent = model_down(val_x3)
-    val_latent = np.array(val_latent).reshape(val_latent.shape[0],-1)
-    train_val_split = np.random.rand(len(val_latent)) < 0.5
-    X_tsne = manifold.TSNE(n_components=2, init='pca', n_iter=500, method='exact').fit_transform(val_latent[train_val_split])
-    y = val_y3[train_val_split].argmax(axis=1).reshape([-1,1])#.argmax(axis=1)
-    x_min, x_max = X_tsne.min(0), X_tsne.max(0)
-    X_norm = (X_tsne - x_min) / (x_max - x_min)
-    plt.figure(figsize=(20, 20))
-    cm = plt.cm.get_cmap('CMRmap')
+        train_val_split = np.random.rand(len(train_data)) < 0.70
+        train_x = train_data[train_val_split]
+        train_y = train_label[train_val_split]
+        val_x = train_data[~train_val_split]
+        val_y = train_label[~train_val_split]
 
-    for i in range(X_norm.shape[0]):    
-        plt.text(X_norm[i, 0], X_norm[i, 1], str(y[i,0]), color=cm(y[i,0]*5), 
-                fontdict={'weight': 'bold', 'size': 9})
-    plt.xticks([])
-    plt.yticks([])
-    #plt.savefig("result/gps_pca_latent16_0710_LPS_2")
-    plt.show()
+        return train_x, train_y, val_x, val_y
+
+    def create_night_dataset(self):
+        datas = glob.glob('transfer0508_night_2/*/*/*.txt')
+        train_data = []
+        train_label = [] 
+        for data in datas:
+            if data.find('timestamp') == -1:
+                f = np.loadtxt(data,delimiter=" ").copy()
+                f = f/[100,10,100,1,10,100,1e+13,1,1e+3,1e+15]
+                f = f[[0,1,2,4]]
+                train_data.append(f)
+                if data.split('/')[1] == "indoor":
+                    train_label.append("indoor"+data.split('/')[-2])
+                else:
+                    train_label.append("outdoor"+data.split('/')[-2])
+                
+        train_data = np.array(train_data).astype('float32')
+        train_label = np.array(pd.get_dummies(train_label)).astype('float32')
+
+        train_val_split = np.random.rand(len(train_data)) < 0.70
+
+        val_x2 = train_data[~train_val_split]
+        val_y2 = train_label[~train_val_split]
+
+        return val_x2, val_y2
+
+    def create_model(self):
+        inp = tf.keras.layers.Input(shape=(4), name='input_layer1')
+        model = tf.keras.layers.Reshape((4,1))(inp)
+        model = tf.keras.layers.Conv1D(32,3)(model)
+        model = tf.keras.layers.AveragePooling1D(strides=1,padding="same")(model)
+        model = dense_block(32,3,3,4)(model)
+        model = transition_block(stride=1)(model)
+        model = dense_block(4,3,3,4)(model)
+        model_down = tf.keras.Model(inputs=[inp], outputs=model)
+
+        inp = tf.keras.layers.Input(shape=(4), name='input_layer2')
+        model = model_down(inp)
+        model = Conv1DTranspose(32,3,1,'valid')(model)
+        model = tf.keras.layers.AveragePooling1D(strides=1,padding='same')(model)
+        model = Conv1DTranspose(1,3,1,'valid')(model)
+        model = tf.keras.layers.AveragePooling1D(strides=1)(model)
+        model = tf.keras.layers.Reshape((4,))(model)
+        model_encoder_decoder = tf.keras.Model(inputs=[inp], outputs=model)
+
+        return model_down, model_encoder_decoder
+
+    def train_step(self, t_x, t_y):
+        with tf.GradientTape() as AE_tape,tf.GradientTape() as ANN_tape:
+            output = self.model_encoder_decoder(t_x, training=True)
+            AE_loss = self.model_loss(output,t_x)
+
+        gradients_AE = AE_tape.gradient(AE_loss, self.model_encoder_decoder.trainable_variables)
+        self.optimizer_A.apply_gradients(zip(gradients_AE, self.model_encoder_decoder.trainable_variables))
+        
+        return np.array(AE_loss).mean()#,np.array(ANN_loss).mean()
+
+    def validation(self, v_x, v_y):
+        output = self.model_encoder_decoder(v_x)
+        mse = losses.MeanSquaredError()
+        AE_loss = mse(v_x, output)
+        print("validation AE loss : {}\n".format(np.array(AE_loss).mean()))
+        return np.array(AE_loss).mean()
+        
+    def train(self, epochs):
+        minimum_delta = 0.00001
+        history = {}
+        history['val_loss'] = np.zeros(epochs)
+        for epoch in range(epochs):
+            start = time.time()
+            all_AE = []
+            for x, y in self.train_dataset:
+                AE_loss = self.train_step(x, y)
+                all_AE.append(AE_loss)
+            print("train AE loss : {}".format(np.array(all_AE).mean()))
+            loss = self.validation(self.val_x, self.val_y)
+            history['val_loss'][epoch] = loss
+            self.checkpoint.save(file_prefix=self.checkpoint_prefix)
+
+            if epoch > 200: #early stop
+                    differences = np.abs(np.diff(history['val_loss'][epoch - 3:epoch], n = 1))
+                    check =  differences > minimum_delta        
+                    if np.all(check == False):
+                        print(differences)
+                        print("\n\nEarlyStopping Evoked! Stopping training\n\n")
+                        break
+                        
+            # print(f'Time for epoch {epoch + 1} is {time.time() - start:.4f} sec')
+
+    def plot_result(self):
+        val_latent = self.model_down(self.val_x3)
+        val_latent = np.array(val_latent).reshape(val_latent.shape[0],-1)
+        train_val_split = np.random.rand(len(val_latent)) < 0.5
+        X_tsne = manifold.TSNE(n_components=2, init='pca', n_iter=500, method='exact').fit_transform(val_latent[train_val_split])
+        y = self.val_y3[train_val_split].argmax(axis=1).reshape([-1,1])#.argmax(axis=1)
+        x_min, x_max = X_tsne.min(0), X_tsne.max(0)
+        X_norm = (X_tsne - x_min) / (x_max - x_min)
+        plt.figure(figsize=(20, 20))
+        cm = plt.cm.get_cmap('CMRmap')
+
+        for i in range(X_norm.shape[0]):    
+            plt.text(X_norm[i, 0], X_norm[i, 1], str(y[i,0]), color=cm(y[i,0]*5), 
+                    fontdict={'weight': 'bold', 'size': 9})
+        plt.xticks([])
+        plt.yticks([])
+        #plt.savefig("result/gps_pca_latent16_0710_LPS_2")
+        plt.show()
+
 
 if __name__ == "__main__":
-    train_x, train_y, val_x, val_y = create_dataset()
-    val_x2, val_y2 = create_night_dataset()
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-    val_x3 = np.concatenate((val_x,val_x2))
-    val_y3 = np.concatenate((val_y,val_y2))
-
-    BUFFER_SIZE = train_x.shape[0]
-    BATCH_SIZE = train_x.shape[0]
-    train_dataset = tf.data.Dataset.from_tensor_slices((train_x,train_y))
-    train_dataset = train_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
-    valid_dataset = tf.data.Dataset.from_tensor_slices((val_x3,val_y3)).batch(len(val_x3))
-
-    model_down, model_encoder_decoder = create_model()
-    # model_down.summary()
-    # model_encoder_decoder.summary()
-    
-    model_loss = losses.MeanSquaredError()
-    learning_rate_A = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1e-2, decay_steps=100, decay_rate=0.9)
-    optimizer_A = tf.optimizers.Adam() #SGD(learning_rate=learning_rate_A , momentum=1e-5)
-    learning_rate_B = tf.keras.optimizers.schedules.ExponentialDecay(initial_learning_rate=1e-2, decay_steps=100, decay_rate=0.9)
-    optimizer_B = tf.optimizers.Adam(learning_rate=learning_rate_B)
-
-    checkpoint_dir = './gps_checkpoints/checkpoints_0710_LPS_2_2'
-    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt_0710_model_{epoch}")
-    checkpoint = tf.train.Checkpoint(optimizerA=optimizer_A, model_encoder_decoder=model_encoder_decoder, model_down=model_down)
-
-    train(20000)
-    plot_result()
+    gps_AE = GPS_AE()
+    gps_AE.train(20000)
+    gps_AE.plot_result()
